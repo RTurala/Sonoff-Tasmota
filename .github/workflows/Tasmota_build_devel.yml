@@ -1,0 +1,294 @@
+name: Build_development
+
+on:
+  workflow_dispatch:      # Start a workflow
+  push:
+    branches: development
+    paths-ignore:
+    - '.github/**'        # Ignore changes towards the .github directory
+    - '**.md'             # Do no build if *.md files changes
+    - 'tasmota/berry/**'  # Ignore Berry examples
+
+# Ensures that only one deploy task per branch/environment will run at a time.
+concurrency:
+  group: environment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  safeboot-images:
+    runs-on: ubuntu-latest
+    if: github.repository == 'arendst/Tasmota'
+    continue-on-error: true
+    strategy:
+      matrix:
+        variant:
+          - tasmota32-safeboot
+          - tasmota32solo1-safeboot
+          - tasmota32s2-safeboot
+          - tasmota32s2cdc-safeboot
+          - tasmota32s3-safeboot
+          - tasmota32s3ser-safeboot
+          - tasmota32c2-safeboot
+          - tasmota32c3-safeboot
+          - tasmota32c3ser-safeboot
+          - tasmota32c5-safeboot
+          - tasmota32c5ser-safeboot
+          - tasmota32c6-safeboot
+          - tasmota32c6ser-safeboot
+          - tasmota32c61-safeboot
+          - tasmota32c61ser-safeboot
+          - tasmota32p4-safeboot
+          - tasmota32p4ser-safeboot
+          - tasmota32p4r3-safeboot
+          - tasmota32p4r3ser-safeboot
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: development
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+      - name: Install dependencies
+        run: |
+          uv pip install --system pioarduino==6.2.0.post1
+          cp ./platformio_override_sample.ini ./platformio_override.ini
+      - name: Add SHA to footer
+        run: |
+          COMMIT_SHA_LONG=$(git rev-parse --short HEAD || echo "")
+          SHA=${COMMIT_SHA_LONG::7}
+          sed -i -e "s/TASMOTA_SHA_SHORT/TASMOTA_SHA_SHORT $SHA-/g" ./tasmota/include/tasmota_version.h
+      - name: Run PlatformIO
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: platformio run -e ${{ matrix.variant }} 
+      - name: Upload safeboot firmware artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.variant }}
+          path: ./build_output
+
+  base-images:
+    runs-on: ubuntu-latest
+    if: github.repository == 'arendst/Tasmota'
+    continue-on-error: true
+    strategy:
+      matrix:
+        variant:
+          - tasmota
+          - tasmota-4M
+          - tasmota-minimal
+          - tasmota-display
+          - tasmota-ir
+          - tasmota-knx
+          - tasmota-lite
+          - tasmota-sensors
+          - tasmota-zbbridge
+          - tasmota-zigbee
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: development
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+      - name: Install dependencies
+        run: |
+          uv pip install --system pioarduino==6.2.0.post1
+      - name: Add SHA to footer
+        run: |
+          COMMIT_SHA_LONG=$(git rev-parse --short HEAD || echo "")
+          SHA=${COMMIT_SHA_LONG::7}
+          sed -i -e "s/TASMOTA_SHA_SHORT/TASMOTA_SHA_SHORT $SHA-/g" ./tasmota/include/tasmota_version.h
+      - name: Run PlatformIO
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: platformio run -e ${{ matrix.variant }}
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.variant }}
+          path: ./build_output
+
+  base32-images:
+    needs: safeboot-images
+    runs-on: ubuntu-latest
+    if: github.repository == 'arendst/Tasmota'
+    continue-on-error: true
+    strategy:
+      matrix:
+        variant:
+          - tasmota32
+          - tasmota32-zbbrdgpro
+          - tasmota32-webcam
+          - tasmota32-bluetooth
+          - tasmota32-nspanel
+          - tasmota32-display
+          - tasmota32-ir
+          - tasmota32-lvgl
+          - tasmota32c2
+          - tasmota32c3
+          - tasmota32c5
+          - tasmota32c6
+          - tasmota32c61
+          - tasmota32p4
+          - tasmota32p4r3
+          - tasmota32s2
+          - tasmota32s2cdc
+          - tasmota32s3
+          - tasmota32solo1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: development
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+      - name: Install dependencies
+        run: |
+          uv pip install --system pioarduino==6.2.0.post1
+          cp ./platformio_override_sample.ini ./platformio_override.ini
+      - name: Download safeboot firmwares
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tasmota32*
+          path: ./temp
+      - name: Move safeboot files
+        run: |
+          mkdir -p ./firmware/firmware
+          find ./temp -type f -exec cp -f -t ./firmware/firmware {} +
+      - name: Add SHA to footer
+        run: |
+          COMMIT_SHA_LONG=$(git rev-parse --short HEAD || echo "")
+          SHA=${COMMIT_SHA_LONG::7}
+          sed -i -e "s/TASMOTA_SHA_SHORT/TASMOTA_SHA_SHORT $SHA-/g" ./tasmota/include/tasmota_version.h
+      - name: Run PlatformIO
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: platformio run -e ${{ matrix.variant }}
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.variant }}
+          path: ./build_output
+
+  language-images:
+    runs-on: ubuntu-latest
+    if: github.repository == 'arendst/Tasmota'
+    continue-on-error: true
+    strategy:
+      matrix:
+        language: [ AD, AF, BG, BR, CN, CZ, DE, ES, FR, FY, GR, HE, HU, IT, KO, LT, NL, PL, PT, RO, RU, SE, SK, TR, TW, UK, VN ]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: development
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+      - name: Install dependencies
+        run: |
+          uv pip install --system pioarduino==6.2.0.post1
+      - name: Add SHA to footer
+        run: |
+          COMMIT_SHA_LONG=$(git rev-parse --short HEAD || echo "")
+          SHA=${COMMIT_SHA_LONG::7}
+          sed -i -e "s/TASMOTA_SHA_SHORT/TASMOTA_SHA_SHORT $SHA-/g" ./tasmota/include/tasmota_version.h
+      - name: Run PlatformIO
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: platformio run -e tasmota-${{ matrix.language }}
+      - name: Upload language firmware artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: tasmota-${{ matrix.language }}
+          path: ./build_output
+
+  language32-images:
+    needs: safeboot-images
+    runs-on: ubuntu-latest
+    if: github.repository == 'arendst/Tasmota'
+    continue-on-error: true
+    strategy:
+      matrix:
+        language: [ AD, AF, BG, BR, CN, CZ, DE, ES, FR, FY, GR, HE, HU, IT, KO, LT, NL, PL, PT, RO, RU, SE, SK, TR, TW, UK, VN ]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: development
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+      - name: Install dependencies
+        run: |
+          uv pip install --system pioarduino==6.2.0.post1
+          cp ./platformio_override_sample.ini ./platformio_override.ini
+      - name: Download safeboot firmwares
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tasmota32*
+          path: ./temp
+      - name: Move safeboot files
+        run: |
+          mkdir -p ./firmware/firmware
+          find ./temp -type f -exec cp -t ./firmware/firmware {} +
+      - name: Add SHA to footer
+        run: |
+          COMMIT_SHA_LONG=$(git rev-parse --short HEAD || echo "")
+          SHA=${COMMIT_SHA_LONG::7}
+          sed -i -e "s/TASMOTA_SHA_SHORT/TASMOTA_SHA_SHORT $SHA-/g" ./tasmota/include/tasmota_version.h
+      - name: Run PlatformIO
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: '1'
+        run: platformio run -e tasmota32-${{ matrix.language }}
+      - name: Upload language firmware artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: tasmota32-${{ matrix.language }}
+          path: ./build_output
+
+  Start_final_copy:
+    needs: [base-images, base32-images, language-images, language32-images]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.API_TOKEN_GITHUB }}
+    steps:
+    - name: Dispatch workflow in arendst/Tasmota-firmware
+      run: |
+        gh api repos/arendst/Tasmota-firmware/actions/workflows/fetch_deploy.yml/dispatches \
+          --method POST \
+          -f ref='gh_actions'

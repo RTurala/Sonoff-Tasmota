@@ -1,0 +1,33 @@
+{
+  "name": "universal display Library",
+  "version": "0.9.0",
+  "description": "General driver library for a couple of display types.",
+  "license": "MIT",
+  "homepage": "https://github.com/arendst/Tasmota",
+  "frameworks": "arduino",
+  "platforms": [
+        "espressif8266",
+        "espressif32"
+  ],
+  "authors": [
+  {
+    "name": "Gerhard Mutz",
+    "maintainer": true
+  },
+  {
+    "name": "Christian Baars",
+    "maintainer": true
+  }
+  ],
+  "build": {
+    "srcFilter": [
+        "+<*>",
+        "+<src/*>"
+    ],
+    "flags": [ 
+      "-I$PROJECT_DIR/include",
+      "-I$PROJECT_DIR/tasmota/include"
+    ],
+    "includeDir": "include"
+  }
+}

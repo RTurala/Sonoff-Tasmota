@@ -1,0 +1,1920 @@
+/*
+  xdrv_85_esp32_ble_eq3_trv.ino - EQ3 radiator valve sense and control via BLE_ESP32 support for Tasmota
+
+  Copyright (C) 2020  Simon Hailes
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+  --------------------------------------------------------------------------------------------
+  Version yyyymmdd  Action    Description
+  --------------------------------------------------------------------------------------------
+  1.0.2.1 20261007  changed - support for encrypted advertisements, send by FW >= 2
+  1.0.2.0 20261004  changed - read advertisements, send by FW >= 2 (https://github.com/dbuezas/eq3-custom-fw)
+  1.0.1.1 20251204  changed - display RSSI in general format "xx% (-yy dBm)"
+                              view on UI only when BLE enabled
+  1.0.1.0 20240113  publish - Add some values to WebUI; code cleanup
+  1.0.0.0 20210910  publish - renamed to xdrv_85, and checked with TAS latest dev branch
+  0.0.0.0 20201213  created - initial version
+*/
+
+
+/*
+Commands:
+e.g. TRV 001A2216A458 settemp 21.5
+TRVPeriod <seconds> - Set the polling interval for eQ-3 TRV devices
+TRVRetries <retries> - Set the maximum number of command transmission retries (0..10)
+TRVOnlyAliased <value> - Filter device polling based on BLEAlias settings
+TRVAliasAsTopic 0|1 - Use alias as MQTT-Topic (default: 1)
+TRVMinRSSI <rssi> - Set the minimum RSSI signal strength threshold for discovering devices (-99..0)
+TRVHideFailedPoll <value> - Toggle suppression of MQTT responses when a periodic polling fails
+TRVDevList / TRVScan - Display all discovered eQ-3 TRVs (aliases)
+TRVReset - Clear the list of discovered devices and command queue
+
+TRV <mac> state - Request current state from the TRV
+TRV <mac> settemp <temperature> - Set the desired target temperature
+TRV <mac> valve on|off - Control the valve state (off = frost protection, on = open completely)
+TRV <mac> on - Set TRV to permanent manual ON mode
+TRV <mac> off - Set TRV to permanent manual OFF mode
+TRV <mac> mode auto|manual|on|off|heat|cool - Switch operation mode
+TRV <mac> auto - Set TRV to automatic schedule mode (same as mode auto)
+TRV <mac> manual - Set TRV to manual mode
+TRV <mac> day - Set temperature to comfort preset
+TRV <mac> night - Set temperature to eco preset
+TRV <mac> setdaynight <daytemp> <nighttemp> - Configure day and night preset temperatures
+TRV <mac> boost [<value>] - Activate boost mode (default) or deactivate it (0 / off)
+TRV <mac> unboost - Explicitly deactivate boost mode
+TRV <mac> lock [<value>] - Disable TRV buttons (default) or enable them (0 / off)
+TRV <mac> unlock - Explicitly enable TRV buttons
+TRV <mac> settime - Synchronize TRV clock with Tasmota time
+TRV <mac> setprofile <day> <profile> - Set week profile program for a day
+TRV <mac> reqprofile <day> - Request day profile from TRV
+TRV <mac> setholiday <yy-mm-dd,hh:mm> <temperature> - Set holiday mode until date/time with temperature
+TRV <mac> setwindowtempdur <temperature> <duration> - Configure open window detection
+TRV <mac> offset <temperature> - Set temperature calibration offset
+TRV <mac> window 0|1 - Tell TRV open (1) or closed (0) window mode - When set to open, it only can be set to close via this command
+
+Responses:
+normal:
+stat/EQ3/001A22092C9A = {
+  "cmd":"state",
+  "result":"ok",
+  "RSSI":-83,
+  "stattime":1613814193,
+  "temp":21.0,
+  "posn":0,
+  "mode":"auto",
+  "boost":"inactive",
+  "dst":"set",
+  "window":"closed",
+  "state":"unlocked",
+  "battery":"GOOD",
+  "windowtemp": 12.0,
+  "windowdur": 15,
+  "day": 21.0,
+  "night": 17.0,
+  "offset": 0.0
+}
+
+holiday:
+as above, but adds ,"holidayend":"YY-MM-DD HH:MM"
+
+when trv <mac> reqprofile is used, adds:
+  "profiledayN":"20.5-07:30,17.0-17:00,22.5-22:00,17.0-24:00"
+where N is the day (0-6) (0 = saturday?).
+
+when trv <mac> setprofile is used, adds:
+"profiledayset":N
+where N is the day (0-6) (0 = saturday?).
+
+on error:
+  "result":"fail",
+
+The driver will try a command three times before reporting
+
+
+4 digit pin calculation: (just for info)
+serialno = "REQ0123456"
+pin = []
+
+x = str((ord(serialno[3]) ^ ord(serialno[7])) % 10)
+pin.append(x)
+x = str((ord(serialno[4]) ^ ord(serialno[8])) % 10)
+pin.append(x)
+x = str((ord(serialno[5]) ^ ord(serialno[9])) % 10)
+pin.append(x)
+x = str((ord(serialno[0]) - ord('A') ^ ord(serialno[6]) - ord('0')) % 10)
+pin.append(x)
+print("".join(pin))
+*/
+
+//#define VSCODE_DEV
+
+#ifdef VSCODE_DEV
+#define ESP32
+#define USE_BLE_ESP32
+#define USE_EQ3_ESP32
+#endif
+
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32C2 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61 || CONFIG_IDF_TARGET_ESP32S3
+#ifdef USE_EQ3_ESP32
+#ifdef ESP32                       // ESP32 only. Use define USE_HM10 for ESP8266 support
+#ifdef USE_BLE_ESP32
+
+#define XDRV_85                    85
+#define D_CMND_EQ3 "TRV"
+
+// Pollintervall in seconds, when TRV is in advertising mode (FW >= 2.0)
+#ifndef EQ3_ADV_POLL_PERIOD
+#define EQ3_ADV_POLL_PERIOD 1800
+#endif
+
+// uncomment for more debug messages
+//#define EQ3_DEBUG
+
+// Simulation - uncomment to simulate a device
+//#define EQ3_SIMULATION
+#ifdef EQ3_SIMULATION
+#define TESTADDR1 (uint8_t[]){0x11, 0x11, 0x11, 0x11, 0x11, 0x11}
+#endif // EQ3_SIMULATION
+
+namespace EQ3_ESP32 {
+
+void CmndTrv(void);
+void CmndTrvPeriod(void);
+void CmndTrvRetries(void);
+void CmndTrvOnlyAliased(void);
+void CmndTrvAliasAsTopic(void);
+void CmndTrvMinRSSI(void);
+void CmndTrvHideFailedPoll(void);
+void CmndTrvReset(void);
+void CmndTrvDevList(void);
+
+constexpr const char kEQ3_Commands[] = D_CMND_EQ3 "|"
+  "|"
+  "Period|"
+  "Retries|"
+  "OnlyAliased|"
+  "AliasAsTopic|"
+  "MinRSSI|"
+  "HideFailedPoll|"
+  "Reset|"
+  "DevList|"
+  "Scan";  // same as devlist
+
+constexpr void (*EQ3_Commands[])(void) = {
+  &CmndTrv,
+  &CmndTrvPeriod,
+  &CmndTrvRetries,
+  &CmndTrvOnlyAliased,
+  &CmndTrvAliasAsTopic,
+  &CmndTrvMinRSSI,
+  &CmndTrvHideFailedPoll,
+  &CmndTrvReset,
+  &CmndTrvDevList,
+  &CmndTrvDevList  // trvScan
+};
+
+enum TrvSubCommand : uint8_t {
+  TRV_POLL = 0,
+  TRV_RAW,
+  TRV_STATE,
+  TRV_SETTIME,
+  TRV_SETTEMP,
+  TRV_OFFSET,
+  TRV_SETDAYNIGHT,
+  TRV_SETWINDOWTEMPDUR,
+  TRV_SETHOLIDAY,
+  TRV_BOOST,
+  TRV_UNBOOST,
+  TRV_LOCK,
+  TRV_UNLOCK,
+  TRV_AUTO,
+  TRV_MANUAL,
+  TRV_ECO,
+  TRV_ON,
+  TRV_OFF,
+  TRV_HEAT,
+  TRV_COOL,
+  TRV_FANONLY,
+  TRV_VALVE,
+  TRV_MODE,
+  TRV_DAY,
+  TRV_NIGHT,
+  TRV_REQPROFILE,
+  TRV_SETPROFILE,
+  TRV_WINDOW,
+  TRV_INFO,
+  TRV_COUNT, // Maxcount - Must match to TrvSubCmds
+  TRV_UNKNOWN = 255 // Helper for error
+};
+
+constexpr const char* const TrvSubCmds[] = {
+  "poll",
+  "raw",
+  "state",
+  "settime",
+  "settemp",
+  "offset",
+  "setdaynight",
+  "setwindowtempdur",
+  "setholiday",
+  "boost",
+  "unboost",
+  "lock",
+  "unlock",
+  "auto",
+  "manual",
+  "eco",
+  "on",
+  "off",
+  "heat",
+  "cool",
+  "fan_only",
+  "valve",
+  "mode",
+  "day",
+  "night",
+  "reqprofile",
+  "setprofile",
+  "window",
+  "info"
+};
+
+enum TrvResponse : uint8_t {
+  TRV_DONE = 0,
+  TRV_QUEUED,
+  TRV_IGNOREDBUSY,
+  TRV_INVCMD,
+  TRV_CMDFAIL,
+  TRV_INVADDR
+};
+ 
+constexpr const char* const TrvResponses[] = {
+  "Done",
+  "queued",
+  "ignoredbusy",
+  "invcmd",
+  "cmdfail",
+  "invaddr"
+};
+
+#ifdef USE_WEBSERVER
+constexpr const char* const web_mode_names[] = {
+  D_AUTOMATIC,
+  D_MANUAL,
+  D_HOLIDAY,
+  D_NA
+};
+constexpr const char* const web_mode_icons[] = {
+  "🕗",
+  "✋",
+  "🌴",
+  "?"
+};
+#endif // USE_WEBSERVER
+
+constexpr const char* const mqtt_mode_names[] = {
+  "auto",
+  "manual",
+  "holiday",
+  "n/a"
+};
+
+const uint8_t* const macprefixes[] = {
+//  (uint8_t*)"\xB8\x27\xEB",
+  (uint8_t*)"\x00\x1a\x22"
+};
+
+constexpr const char EQ3_Svc[]         = "3e135142-654f-9090-134a-a6ff5bb77046";
+constexpr const char EQ3_rw_Char[]     = "3fa4585a-ce4a-3bad-db4b-b8df8179ea09";
+constexpr const char EQ3_notify_Char[] = "d0e8434d-cd29-0996-af41-6c90f4e0eb2a";
+
+constexpr const char* const EQ3Names[] = {
+  "CC-RT-BLE",
+  "CC-RT-M-BLE",
+  "eQ3-"
+};
+
+struct eq3_device_t {
+  uint64_t timeoutTime;      // 8 Bytes
+  float Temperature;         // 4 Bytes
+  float TargetTemp;          // 4 Bytes
+  float battVolt;            // 4 Bytes
+  uint32_t lastStatusTime;   // 4 Bytes
+  uint32_t modeValid        : 1;  // Bit 0
+  uint32_t boostValid       : 1;  // Bit 1
+  uint32_t DSTValid         : 1;  // Bit 2
+  uint32_t windowValid      : 1;  // Bit 3
+  uint32_t lockValid        : 1;  // Bit 4
+  uint32_t batteryValid     : 1;  // Bit 5
+  uint32_t tempValid        : 1;  // Bit 6
+  uint32_t targetTempValid  : 1;  // Bit 7
+  uint32_t battVoltValid    : 1;  // Bit 8
+  uint32_t valveValid       : 1;  // Bit 9
+  uint32_t firmwareValid    : 1;  // Bit 10
+  uint32_t holidayEndValid  : 1;  // Bit 11
+  uint32_t cryptState       : 1;  // Bit 12
+  uint32_t BTHomeAdvert     : 1;  // Bit 13
+  uint32_t Changed          : 1;  // Bit 14
+  union {                    // 1 Byte
+    uint8_t Status2;
+    struct {
+      uint8_t Mode       : 2;
+      uint8_t Boost      : 1;
+      uint8_t DST        : 1;
+      uint8_t Window     : 1;
+      uint8_t Lock       : 1;
+      uint8_t reserved   : 1;
+      uint8_t Battery    : 1;
+    };
+  };
+  int8_t RSSI;               // 1 Byte
+  uint8_t nextDiscoveryData; // 1 Byte
+  uint8_t ValvePos;          // 1 Byte
+  uint8_t Firmware;          // 1 Byte
+  uint8_t battPercent;       // 1 Byte
+  uint8_t holidayEndYear;    // 1 Byte
+  uint8_t holidayEndMonth;   // 1 Byte
+  uint8_t holidayEndDay;     // 1 Byte
+  uint8_t holidayEndHour;    // 1 Byte
+  uint8_t holidayEndMinute;  // 1 Byte
+  uint8_t addr[6];           // 6 Bytes
+};
+
+/*********************************************************************************************\
+ * variables to control operation
+\*********************************************************************************************/
+int retries = 0;
+// allow 240s before timeout of sa device - based on that we restart BLE if we don't see adverts for 120s
+#define EQ3_TIMEOUT 240L
+
+#define EQ3_NUM_DEVICESLOTS 16
+eq3_device_t EQ3Devices[EQ3_NUM_DEVICESLOTS] = {};
+SemaphoreHandle_t EQ3mutex = nullptr;
+
+uint16_t EQ3Period = 300;
+uint8_t EQ3Retries = 4;
+uint8_t EQ3OnlyAliased = 0;
+bool opInProgress = false;
+bool EQ3AliasAsTopic = true;
+int EQ3CurrentSingleSlot = 0;
+
+uint8_t EQ3TopicStyle = 1;
+bool EQ3HideFailedPoll = true;
+int8_t trvMinRSSI = -99;
+
+// control of timing of sending polling.
+// we leave an interval between polls to allow scans to take place
+uint8_t nextEQ3Poll = 0;
+uint16_t NextPollSeconds = 20;
+
+struct op_t {
+  uint8_t addr[6];
+  uint8_t towrite[16];
+  uint8_t writelen;
+  uint8_t cmdtype;
+};
+
+std::deque<std::unique_ptr<EQ3_ESP32::op_t>> opQueue;
+
+int EQ3Send(const uint8_t* addr, uint8_t CmdIdx, const char* param1, const char* param2, bool useAlias);
+int EQ3GenericOpCompleteFn(BLE_ESP32::generic_sensor_t* pStruct);
+void EQ3publishUpdate(void);
+void EQ3publishMain(eq3_device_t* eq3);
+
+/*********************************************************************************************\
+ * Functions
+\*********************************************************************************************/
+
+const char* addrStr(const uint8_t* addr, bool useAlias = false) {
+  static char addrstr[32];
+
+  const char* id = nullptr;
+  if (useAlias) {
+    id = BLE_ESP32::getAlias(addr);
+  }
+  if (!id || !*id) {
+    id = addrstr;
+    BLE_ESP32::dump(addrstr, 13, addr, 6);
+  }
+  return id;
+}
+
+uint8_t TrvCmdToIdx(const char* input) {
+  if (!input || !*input) return TRV_UNKNOWN;
+  for (uint8_t i = 0; i < TRV_COUNT; i++)
+    if (!strcasecmp(input, TrvSubCmds[i])) return i;
+  return TRV_UNKNOWN;
+}
+
+const char* IdxToTrvCmd(uint8_t index) {
+  if (index >= TRV_COUNT) return "unknown";
+  return TrvSubCmds[index];
+}
+
+char* topicPrefix(int prefix, const uint8_t* addr, bool useAlias) {
+  static char stopic[TOPSZ];
+  const char* id = addrStr(addr, useAlias && EQ3AliasAsTopic);
+  if (!EQ3TopicStyle) {
+    GetTopic_P(stopic, prefix, TasmotaGlobal.mqtt_topic, "");
+    strlcat(stopic, "EQ3/", sizeof(stopic));
+    strlcat(stopic, id, sizeof(stopic));
+  } else {
+    char p[] = "EQ3";
+    GetTopic_P(stopic, prefix, p, id);
+  }
+  return stopic;
+}
+
+bool matchPrefix(const uint8_t* addr) {
+  for (const uint8_t* prefix : macprefixes) {
+    if (!memcmp(addr, prefix, 3)) return true;
+  }
+  return false;
+}
+
+bool EQ3Operation(const uint8_t* MAC, const uint8_t* data, int datalen, int cmdtype, uint8_t retries_in = 0) {
+  BLE_ESP32::generic_sensor_t* op = nullptr;
+
+  // ALWAYS use this function to create a new one.
+  int res = BLE_ESP32::newOperation(&op);
+  if (!res) {
+    AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Can't get a newOperation \"%s\" from BLE", addrStr(MAC), IdxToTrvCmd(cmdtype & 0x7f));
+    retries = 0;
+    return 0;
+  } else {
+#ifdef EQ3_DEBUG
+    AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Got a newOperation \"%s\" from BLE", addrStr(MAC), IdxToTrvCmd(cmdtype & 0x7f));
+#endif
+  }
+
+  NimBLEAddress addr((uint8_t*)MAC, 0); //type 0 is public
+  op->addr = addr;
+
+  bool havechar = false;
+  op->serviceUUID = NimBLEUUID(EQ3_Svc);
+  op->characteristicUUID = NimBLEUUID(EQ3_rw_Char);
+  op->notificationCharacteristicUUID = NimBLEUUID(EQ3_notify_Char);
+
+  if (data && datalen) {
+    op->writelen = datalen;
+    memcpy(op->dataToWrite, data, datalen);
+  } else {
+    op->writelen = 1;
+    op->dataToWrite[0] = 0x03; // just request status
+  }
+
+  // this op will call us back on complete or failure.
+  op->completecallback = (void*)EQ3GenericOpCompleteFn;
+  // store this away for later
+  op->context = (void*)cmdtype;
+
+  // Do not request notification for window command, as it will not be sent
+  if ((cmdtype & 0x7f) == TRV_WINDOW) op->notificationCharacteristicUUID = NimBLEUUID();
+
+  res = BLE_ESP32::extQueueOperation(&op);
+  if (!res) {
+    // if it fails to add to the queue, do please delete it
+    BLE_ESP32::freeOperation(&op);
+    AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Failed to queue new operation \"%s\" - deleted", addrStr(MAC), IdxToTrvCmd(cmdtype & 0x7f));
+    retries = 0;
+  } else {
+    if (retries_in) {
+      retries = retries_in;
+    }
+  }
+
+  return res;
+}
+
+void EQ3DoOp() {
+  if (!opInProgress && !opQueue.empty()) {
+    op_t* op = opQueue.front().get();
+
+/// Simulation
+#ifdef EQ3_SIMULATION
+    if (!memcmp(op->addr, TESTADDR1, 6)) {
+      AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: Operation 1/%u \"%s\" only simulated -> removed", addrStr(op->addr), opQueue.size(), IdxToTrvCmd(op->cmdtype & 0x7f));
+      opQueue.pop_front(); 
+      return;
+    }
+#endif // EQ3_SIMULATION
+
+    if (EQ3Operation(op->addr, op->towrite, op->writelen, op->cmdtype, EQ3Retries)) {
+      opInProgress = true;
+      AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: Operation 1/%u \"%s\" processing", addrStr(op->addr), opQueue.size(), IdxToTrvCmd(op->cmdtype & 0x7f));
+    } else {
+      AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Operation 1/%u \"%s\" not started -> removed", addrStr(op->addr), opQueue.size(), IdxToTrvCmd(op->cmdtype & 0x7f));
+      opQueue.pop_front(); 
+    }
+  }
+}
+
+int EQ3QueueOp(const uint8_t* MAC, const uint8_t* data, int datalen, int cmdtype, bool useAlias) {
+  auto newop = std::make_unique<op_t>();
+  memcpy(newop->addr, MAC, 6);
+  memcpy(newop->towrite, data, datalen);
+  newop->writelen = datalen;
+  newop->cmdtype = cmdtype | (useAlias ? 0x80 : 0);
+  size_t qlen = opQueue.size() + 1;
+  AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: Operation 1/%u \"%s\" queued", addrStr(newop->addr), qlen, IdxToTrvCmd(newop->cmdtype & 0x7f));
+  opQueue.push_back(std::move(newop));
+  EQ3DoOp();
+  return qlen;
+}
+
+void EQ3ParseOp(BLE_ESP32::generic_sensor_t* op, bool failed) {
+  uint8_t addrev[6];
+  const uint8_t* native = op->addr.getVal();
+
+  memcpy(addrev, native, 6);
+  BLE_ESP32::ReverseMAC(addrev);
+
+  eq3_device_t* eq3 = nullptr;
+
+  for (auto& device : EQ3Devices) {
+    if (!memcmp(device.addr, addrev, 6)) {
+      eq3 = &device;
+      break;
+    }
+  }
+  if (!eq3) return;
+
+  uint8_t cmdtype = ((uintptr_t)op->context) & 0x7F;
+  bool useAlias = ((uintptr_t)op->context) & 0x80;
+
+  Response_P("{");
+  ResponseAppend_P("\"cmd\":\"%s\"", IdxToTrvCmd(cmdtype));
+  ResponseAppend_P(",\"result\":\"%s\",", failed ? "fail" : "ok");
+
+  // If op failed only publish known values
+  if (failed) {
+    if (cmdtype == TRV_POLL && EQ3HideFailedPoll) {
+      AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: Poll fail not sent because EQ3HideFailedPoll", addrStr(addrev));
+    } else {
+      EQ3publishMain(eq3);
+      ResponseJsonEnd();
+      MqttPublish(topicPrefix((int)STAT, eq3->addr, BLE_ESP32::getAlias(eq3->addr)), false);
+    }
+    return;
+  }
+
+  // Handle TRV_WINDOW write notification, as it returns no state
+  if (cmdtype == TRV_WINDOW) {
+    eq3->windowValid = false; // Set to unknown
+    EQ3Send(eq3->addr, TRV_POLL, nullptr, nullptr, useAlias); //  Poll to get new state
+  }
+
+  // Handle TRV_INFO (Firmware) answer
+  if (cmdtype == TRV_INFO && op->notifylen >= 15 && op->dataNotify[0] == 1 && op->dataNotify[2] == 0 && op->dataNotify[3] == 0) {
+    eq3->Firmware = op->dataNotify[1];
+    eq3->firmwareValid = true;
+  }
+
+  // Handle main data of status answer
+  if (op->notifylen >= 6 && op->dataNotify[0] == 2 && op->dataNotify[1] == 1) {
+    eq3->lastStatusTime = UtcTime();
+    eq3->TargetTemp = op->dataNotify[5] / 2.0f;
+    eq3->targetTempValid = true;
+    eq3->ValvePos = op->dataNotify[3];
+    eq3->valveValid = true;
+    eq3->Status2 = op->dataNotify[2]; // Bitfield with the following values
+    eq3->modeValid = true;
+    eq3->boostValid = true;
+    eq3->DSTValid = true;
+    eq3->windowValid = true;
+    eq3->lockValid = true;
+    eq3->batteryValid = true;
+    if (op->notifylen >= 10) { // Handle holiday end
+      eq3->holidayEndYear = op->dataNotify[7];
+      eq3->holidayEndMonth = op->dataNotify[9];
+      eq3->holidayEndDay = op->dataNotify[6];
+      eq3->holidayEndHour = op->dataNotify[8] / 2;
+      eq3->holidayEndMinute = (op->dataNotify[8] & 1) * 30;
+      eq3->holidayEndValid = (bool)op->dataNotify[9];
+    }
+  }
+
+  // Publish main data of known status values
+  EQ3publishMain(eq3);
+
+  // Handle and append data of TRV_RAW
+  if (cmdtype == TRV_RAW) {
+    char raw[40];
+    BLE_ESP32::dump(raw, 40, op->dataNotify, op->notifylen);
+    ResponseAppend_P(",\"raw\":\"%s\"", raw);
+  }
+
+  // Handle and append data of window, temperature presets and offset
+  if ((op->notifylen >= 15) && (op->dataNotify[0] == 2) && (op->dataNotify[1] == 1)) {
+    float f_temp;
+    f_temp = op->dataNotify[10] /  2.0f;
+    ResponseAppend_P(",\"windowtemp\":%1_f", &f_temp);
+    ResponseAppend_P(",\"windowdur\":%u", op->dataNotify[11] * 5);
+    f_temp = op->dataNotify[12] / 2.0f;
+    ResponseAppend_P(",\"day\":%1_f", &f_temp);
+    f_temp = op->dataNotify[13] / 2.0f;
+    ResponseAppend_P(",\"night\":%1_f", &f_temp);
+    f_temp = (op->dataNotify[14] - 7) / 2.0f;
+    ResponseAppend_P(",\"offset\":%1_f", &f_temp);
+  }
+
+  // Handle and append data of profiledayset
+  if ((op->notifylen >= 3) && (op->dataNotify[0] == 2) && (op->dataNotify[1] == 2)) {
+    ResponseAppend_P(",\"profiledayset\":%d", op->dataNotify[2]);
+  }
+
+  // Handle and append profile data
+  if ((op->notifylen >= 16) && (op->dataNotify[0] == 0x21)) {
+    //YY is the time, coded as (minutes/10), up to which to maintain the temperature declared in XX
+    //XX represents the temperature to be maintained until then, codified as (temperature*2)
+    // byte 0: 21 (default value)
+    // byte 1: 02 (Monday = 0x02)
+    // byte (2,3): 22 24 (17°C up to 06:00)
+    // byte (4,5): 2A 36 (21°C up to 09:00)
+    // byte (6,7): 22 66 (17°C up to 17:00)
+    // byte (8,9): 2A 8A (21°C up to 23:00)
+    // byte (10,11): 22 90 (17°C up to 24:00)
+    // byte (12,13): 22 90 (unused)
+    // byte (14,15): 22 90 (unused)
+    ResponseAppend_P(",\"profileday%d\":\"", op->dataNotify[1]);
+    uint8_t* data = op->dataNotify + 2;
+    for (uint8_t i = 0; i < 7; i++) {
+      float t = *(data++);
+      t /= 2;
+      int mm = *(data++);
+      mm *= 10;
+      int hh = mm / 60;
+      mm = mm % 60;
+      ResponseAppend_P("%1_f-%02d:%02d", &t, hh, mm);
+      // stop if the last one is 24.
+      if (hh == 24) {
+        break;
+      }
+      if (i < 6) ResponseAppend_P(",");
+    }
+    ResponseAppend_P("\"");
+  }
+
+  ResponseJsonEnd();
+  MqttPublish(topicPrefix((int)STAT, eq3->addr, BLE_ESP32::getAlias(eq3->addr)), false);
+}
+
+int EQ3GenericOpCompleteFn(BLE_ESP32::generic_sensor_t* op) {
+  const bool is_failed = (op->state <= GEN_STATE_FAILED);
+  const uint32_t context = (uintptr_t)op->context;
+
+  uint8_t addrev[6];
+  std::copy_n(op->addr.getVal(), 6, addrev);
+  BLE_ESP32::ReverseMAC(addrev);
+
+  if (is_failed && retries > 1) {
+    retries--;
+
+    if (EQ3Operation(addrev, op->dataToWrite, op->writelen, (int)context)) {
+      AddLog(LOG_LEVEL_INFO, "EQ3: %s: Operation 1/%u \"%s\" failed - retries left: %d/%d - State: %s (%d)", addrStr(addrev), opQueue.size(), IdxToTrvCmd(context & 0x7f), retries, EQ3Retries, BLE_ESP32::getStateString(op->state), op->state);
+      opInProgress = true;
+      return 0; 
+    }
+    retries = 0; 
+  }
+
+  if (is_failed) {
+    AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Operation 1/%u \"%s\" final fail - State: %s (%d)", addrStr(addrev), opQueue.size(), IdxToTrvCmd(context & 0x7f), BLE_ESP32::getStateString(op->state), op->state);
+  } else {
+    AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: Operation 1/%u \"%s\" done", addrStr(addrev), opQueue.size(), IdxToTrvCmd(context & 0x7f));
+  }
+  
+  EQ3ParseOp(op, is_failed);
+  retries = 0;
+  opInProgress = false;
+
+  if (!opQueue.empty()) opQueue.pop_front();
+
+  if (opQueue.empty()) {
+    AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: Operation queue is empty", addrStr(addrev));
+  }
+
+  return 0;
+}
+
+/*********************************************************************************************\
+ * Functions actualy called from within the BLE task
+\*********************************************************************************************/
+
+void TaskEQ3AddDevice(int8_t RSSI, const uint8_t* addr) {
+  eq3_device_t* targetDevice = nullptr;
+  eq3_device_t* firstFreeSlot = nullptr;
+
+  for (auto& device : EQ3Devices) {
+    if (!memcmp(addr, device.addr, 6)) {
+      targetDevice = &device;
+      break; 
+    }
+    if (!device.timeoutTime && !firstFreeSlot) {
+      firstFreeSlot = &device;
+    }
+  }
+
+  if (!targetDevice) {
+    if (firstFreeSlot) {
+      targetDevice = firstFreeSlot;
+      NextPollSeconds = 1;
+      AddLog(LOG_LEVEL_INFO, "EQ3: %s: New TRV at slot %d", addrStr(addr), targetDevice - EQ3Devices);
+    } else {
+      AddLog(LOG_LEVEL_ERROR, "EQ3: %s: All %d slots used", addrStr(addr), EQ3_NUM_DEVICESLOTS);
+      return;
+    }
+  }
+
+  targetDevice->timeoutTime = esp_timer_get_time() + 1000000ULL * EQ3_TIMEOUT;
+  memcpy(targetDevice->addr, addr, 6);
+  targetDevice->RSSI = RSSI;
+}
+
+// ************** Check and parse BTHome packet, sent from custom firmware *************************
+void TaskEQ3ParseBTHome(BLE_ESP32::ble_advertisment_t* pStruct) {
+  const uint8_t* addr = pStruct->addr;
+  const BLEAdvertisedDevice* advertisedDevice = pStruct->advertisedDevice;
+
+  if (!advertisedDevice->getServiceDataCount()) return;
+  if (advertisedDevice->getServiceDataUUID(0) != NimBLEUUID((uint16_t)0xFCD2)) return; // No BTHome packet
+
+  std::string ServiceDataStr = advertisedDevice->getServiceData(0);
+  uint32_t  ServiceDataLength = ServiceDataStr.length();
+  const uint8_t* ServiceData = (const uint8_t*)ServiceDataStr.data();
+  char temp[60];
+  BLE_ESP32::dump(temp, 60, ServiceData, ServiceDataLength);
+  AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG_MORE], "EQ3: %s: SrvData %s", addrStr(addr), temp);
+
+  if ((ServiceData[0] >> 5) & 0x07 != 2) return; // Not BThome V2
+
+  // Find device
+  eq3_device_t* eq3 = nullptr;
+  for (auto& device : EQ3Devices) {
+    if (!memcmp(device.addr, addr, 6)) {
+      eq3 = &device;
+      break;
+    }
+  }
+
+  if (!eq3) return; // Device not yet known
+
+  eq3->BTHomeAdvert = false; // Will become true, when unencrypted data is available for parsing
+  eq3->cryptState = ServiceData[0] & 1;
+
+  AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec%s ADV for known device", addrStr(addr), eq3->cryptState ? " encrypted" : "");
+
+  if (eq3->cryptState) {
+#ifdef USE_MI_ESP32
+#define USE_MI_DECRYPTION // Just to be sure...
+      uint8_t* bufPtr = (uint8_t*)ServiceDataStr.data();
+      uint32_t micTag = *(uint32_t*)(bufPtr + (ServiceDataLength - 4));
+      uint8_t nonce[13];
+      memcpy(nonce, addr, 6); 
+      nonce[6] = 0xD2;
+      nonce[7] = 0xFC;
+      nonce[8] = bufPtr[0];
+      memcpy(&nonce[9], bufPtr + (ServiceDataLength - 8), 4);
+      uint8_t* cipherText = bufPtr + 1;
+      int cipherLen = ServiceDataLength - 9;
+      eq3->cryptState = (bool)(MIDecryptPayload(addr, nonce, micTag, cipherText, cipherLen));
+      if (eq3->cryptState) return; // Decrypt failed on any reason
+      ServiceDataLength -= 8;
+      ServiceData = bufPtr;
+#else // USE_MI_ESP32
+      AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Decryption not possible. Please compile with \"#define USE_MI_ESP32\".", addrStr(addr));
+      return; 
+#endif // USE_MI_ESP32
+  }
+
+  eq3->BTHomeAdvert = true;
+
+  uint32_t pos = 1;
+  bool firstTemp = true;
+  float floatVal;
+  while (pos < ServiceDataLength) {
+    switch (ServiceData[pos]) {
+      case 0x02: // Temp
+        pos += 3;
+        if (pos > ServiceDataLength) break;
+        floatVal = (ServiceData[pos - 2] | ServiceData[pos - 1] << 8) * 0.01f;
+        if (firstTemp) {
+          eq3->Changed |= (eq3->Temperature != floatVal);
+          eq3->Temperature = floatVal;
+          eq3->tempValid = true;
+          AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Ambient temp: %1_f", addrStr(addr), &eq3->Temperature);
+          firstTemp = false;
+        } else {
+          eq3->Changed |= (eq3->TargetTemp != floatVal);
+          eq3->TargetTemp = floatVal;
+          eq3->targetTempValid = true;
+          AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Target temp: %1_f", addrStr(addr), &eq3->TargetTemp);
+        }
+        break;
+      case 0x0C: // Voltage
+        pos += 3;
+        if (pos > ServiceDataLength) break;
+        floatVal = (ServiceData[pos - 2] | ServiceData[pos - 1] << 8) * 0.001f;
+        eq3->Changed |= (eq3->battVolt != floatVal);
+        eq3->battVolt = floatVal;
+        eq3->battPercent = changeUIntScale(floatVal * 1000, 2200, 3000, 0, 100); // Map 2.2V-3.0V to 0%-100%
+        eq3->battVoltValid = true;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Batt: %3_f (%u%%)", addrStr(addr), &eq3->battVolt, eq3->battPercent);
+        break;
+      case 0x2F: // Valve
+        pos += 2;
+        if (pos > ServiceDataLength) break;
+        eq3->Changed |= (eq3->ValvePos != ServiceData[pos - 1]);
+        eq3->ValvePos = ServiceData[pos - 1];
+        eq3->valveValid = true;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Valve: %u", addrStr(addr), eq3->ValvePos);
+        break;
+      case 0x09: // Mode
+        pos += 2;
+        if (pos > ServiceDataLength) break;
+        if (eq3->Mode != ServiceData[pos - 1]) {
+          eq3->Changed = true;
+          eq3->Mode = ServiceData[pos - 1];
+          // Force poll if mode changed to HOLIDAY to get holiday end
+          if (eq3->Mode == 2) {
+            eq3->holidayEndValid = false;
+            EQ3Send(eq3->addr, TRV_POLL, nullptr, nullptr, 1);
+          }
+        }
+        eq3->modeValid = true;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Mode: %u", addrStr(addr), eq3->Mode);
+        break;
+      case 0x15: // Battery
+        pos += 2;
+        if (pos > ServiceDataLength) break;
+        eq3->Changed |= (eq3->Battery != ServiceData[pos - 1]);
+        eq3->Battery = ServiceData[pos - 1];
+        eq3->batteryValid = true;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Battery: %u", addrStr(addr), eq3->Battery);
+        break;
+      case 0x0F: // Boost
+        pos += 2;
+        if (pos > ServiceDataLength) break;
+        eq3->Changed |= (eq3->Boost != ServiceData[pos - 1]);
+        eq3->Boost = ServiceData[pos - 1];
+        eq3->boostValid = true;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Boost: %u", addrStr(addr), eq3->Boost);
+        break;
+      case 0x2D: // Window
+        pos += 2;
+        if (pos > ServiceDataLength) break;
+        eq3->Changed |= (eq3->Window != ServiceData[pos - 1]);
+        eq3->Window = ServiceData[pos - 1];
+        eq3->windowValid = true;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Window: %u", addrStr(addr), eq3->Window);
+        break;
+      case 0x1F: // Lock !! inverted value !!
+        pos += 2;
+        if (pos > ServiceDataLength) break;
+        eq3->Changed |= (eq3->Lock != !ServiceData[pos - 1]);
+        eq3->Lock = !ServiceData[pos - 1];
+        eq3->lockValid = true;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Lock: %u", addrStr(addr), eq3->Lock);
+        break;
+      case 0x19: // Connectivity
+        pos += 2;
+        if (pos > ServiceDataLength) break;
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Rec ADV Connected: %u", addrStr(addr), ServiceData[pos - 1]);
+        break;
+      default:
+        AddLog(LOG_LEVEL_INFO, "EQ3: %s: Rec unhandled ADV %02X", addrStr(addr), ServiceData[pos]);
+        pos ++;
+        break;
+    }
+  }
+}
+
+int TaskEQ3advertismentCallback(BLE_ESP32::ble_advertisment_t* pStruct)
+{
+  // we will try not to use this...
+  const BLEAdvertisedDevice* advertisedDevice = pStruct->advertisedDevice;
+
+  int8_t RSSI = pStruct->RSSI;
+  const uint8_t* addr = pStruct->addr;
+  std::string sname = advertisedDevice->getName();
+
+  // Filter devices by alias
+  const char* alias = BLE_ESP32::getAlias(addr);
+  if (!alias) alias = "";
+  if (EQ3OnlyAliased) {
+    if (!*alias) return 0;  // No alias -> do not process
+    if (EQ3OnlyAliased == 2 && strncmp(alias, "EQ3", 3)) return 0; // Alias not starting with "EQ3" -> do not process
+  } 
+
+  // Identify device by MAC prefix
+  bool found = matchPrefix(addr);
+
+  // Identify device by device name; active scan needed
+  if (!found) {
+    for (const char* eq3Name : EQ3Names) {
+      if (sname.starts_with(eq3Name)) {
+        found = true;
+        break;
+      }
+    }
+  }
+
+  if (!found) return 0;
+
+#ifdef EQ3_DEBUG
+  AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Device seen", addrStr(addr));
+#endif
+
+  // this will take and keep the mutex until the function is over
+  TasAutoMutex localmutex(&EQ3mutex);
+  TaskEQ3AddDevice(RSSI, addr);
+  TaskEQ3ParseBTHome(pStruct);
+  return 0;
+}
+
+/*********************************************************************************************\
+ * Helper functions
+\*********************************************************************************************/
+
+const char *EQ3DeviceName(char *name, size_t name_size, const eq3_device_t *device) {
+  if (!device) return "";
+  const char *label = BLE_ESP32::getAlias(device->addr);
+  if (!(label && *label)) {
+    ext_snprintf_P(name, name_size, "eQ3-%3_H", device->addr + 3);
+    label = name;
+  }
+  return label;
+}
+
+int EQ3DeviceCmp(uint8_t a, uint8_t b) {
+  char name_a[32];
+  const char *label_a = EQ3DeviceName(name_a, sizeof(name_a), &EQ3Devices[a]);
+  char name_b[32];
+  const char *label_b = EQ3DeviceName(name_b, sizeof(name_b), &EQ3Devices[b]);
+  return strcasecmp(label_a, label_b);
+}
+
+/*********************************************************************************************\
+ * init
+\*********************************************************************************************/
+void EQ3Init(void) {
+  memset(&EQ3Devices, 0, sizeof(EQ3Devices));
+  BLE_ESP32::registerForAdvertismentCallbacks((const char*)"EQ3", TaskEQ3advertismentCallback);
+#ifdef EQ3_DEBUG
+  AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_INFO], "EQ3: init: request callbacks");
+#endif
+
+  EQ3Period = tmax(Settings->tele_period, EQ3_NUM_DEVICESLOTS);
+}
+
+/***********************************************************************\
+ * Regular
+\***********************************************************************/
+
+/**
+ * @brief Main loop of the driver, "high level"-loop
+ *
+ */
+
+void EQ3EverySecond(void) {
+
+/// Check for timeout, changed value and cleanup devices ////
+  for (auto& device : EQ3Devices) {
+    if (device.timeoutTime && (device.timeoutTime < esp_timer_get_time() || !BLE_ESP32::BLEMasterEnable)) {
+      AddLog(LOG_LEVEL_INFO, "EQ3: %s: Timed out -> removed", addrStr(device.addr));
+      device = eq3_device_t{};
+    }
+    if (device.Changed) {
+      AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: Value changed -> publish update", addrStr(device.addr));
+      Response_P("{");
+      EQ3publishMain(&device);
+      ResponseJsonEnd();
+      MqttPublish(topicPrefix((int)STAT, device.addr, BLE_ESP32::getAlias(device.addr)), false);
+      device.Changed = false;
+    }
+  }
+
+/// Handle polling ////
+  if (NextPollSeconds) NextPollSeconds--;
+  if (!NextPollSeconds && EQ3Period && opQueue.empty() && !opInProgress) {
+    uint8_t activeDevices = 0;
+    for (const auto& dev : EQ3Devices) {
+      if (dev.timeoutTime) activeDevices++;
+    }
+    if (activeDevices) {
+      for (uint8_t i = 0; i < EQ3_NUM_DEVICESLOTS; i++) {
+        uint8_t currentIdx = (nextEQ3Poll + i) % EQ3_NUM_DEVICESLOTS;
+        auto& device = EQ3Devices[currentIdx];
+        if (!device.timeoutTime) continue;
+        if (device.RSSI < trvMinRSSI) {
+          AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: RSSI %d < min %d, poll suppressed", addrStr(device.addr), device.RSSI, trvMinRSSI);
+          continue; 
+        }
+        if (!device.BTHomeAdvert || device.lastStatusTime + EQ3_ADV_POLL_PERIOD < UtcTime()) {
+          EQ3Send(device.addr, TRV_POLL, nullptr, nullptr, 1);
+        }
+        nextEQ3Poll = (currentIdx + 1) % EQ3_NUM_DEVICESLOTS;
+        NextPollSeconds = tmax(EQ3Period / activeDevices, 3);
+        break;
+      }
+    } else {
+      NextPollSeconds = EQ3Period; 
+    }
+  }
+
+//// start next op now, if we have any queued ////
+  EQ3DoOp();
+
+//// Simulation ////
+#ifdef EQ3_SIMULATION
+  TaskEQ3AddDevice(-RtcTime.second - 30, TESTADDR1);
+  if (TasmotaGlobal.uptime < 120) {
+    for (auto& dev : EQ3Devices) {
+      if (!memcmp(dev.addr, TESTADDR1, 6)) dev.lastStatusTime = UtcTime();
+    }
+  }
+#endif // EQ3_SIMULATION
+
+}
+
+/*********************************************************************************************\
+ * Presentation
+\*********************************************************************************************/
+
+void EQ3SendCurrentDevices(void) {
+  bool added = false;
+  Response_P("{\"devices\":{");
+  for (const auto& device : EQ3Devices) {
+    if (!device.timeoutTime) continue;
+    if (added) ResponseAppend_P(",");
+    ResponseAppend_P("\"%s\":%d", addrStr(device.addr), device.RSSI);
+    added = true;
+  }
+  ResponseJsonEndEnd();
+  MqttPublishPrefixTopic_P(STAT, "EQ3", false);
+}
+
+int EQ3SendResult(char* requested, const char* result) {
+  // send the result
+  Response_P("{\"result\":\"%s\"}", result);
+  static char stopic[TOPSZ];
+  GetTopic_P(stopic, STAT, TasmotaGlobal.mqtt_topic, "");
+  strlcat(stopic, "EQ3/", sizeof(stopic));
+  strlcat(stopic, requested, sizeof(stopic));
+  MqttPublish(stopic, false);
+  return 0;
+}
+
+#ifdef USE_WEBSERVER
+constexpr const char HTTP_EQ3_STATUS1[]     = "<tr><th colspan=2 nowrap><span title='eQ-3 TRV%s\n0x%6_H'>%s</span><span style='float:right'>";
+constexpr const char HTTP_EQ3_STATUS2[]     = "<span title='%s'>%s</span>";
+constexpr const char HTTP_EQ3_TEMPERATURE[] = "{s}┆ " D_THERMOSTAT_SET_POINT "{m}%*_f " D_UNIT_DEGREE "%c{e}";
+constexpr const char HTTP_EQ3_VALVE_POS[]   = "{s}┆ " D_THERMOSTAT_VALVE_POSITION "{m}%d " D_UNIT_PERCENT "{e}";
+
+void EQ3Show(void)
+{
+  char c_unit = D_UNIT_CELSIUS[0]; // ToDo: Check if fahrenheit is possible -> temp_format==TEMP_CELSIUS ? D_UNIT_CELSIUS[0] : D_UNIT_FAHRENHEIT[0];
+  bool FirstSensorShown = false;
+  uint8_t sortedIndex[EQ3_NUM_DEVICESLOTS];
+  uint8_t activeDevicesCount = 0;
+
+  for (uint8_t i = 0; i < EQ3_NUM_DEVICESLOTS; i++) {
+    if (EQ3Devices[i].timeoutTime) {
+      sortedIndex[activeDevicesCount] = i;
+      activeDevicesCount++;
+    }
+  }
+
+  // Sort active devices (Insertion Sort)
+  for (uint8_t i = 1; i < activeDevicesCount; i++) {
+    uint8_t key = sortedIndex[i];
+    uint8_t j = i;
+    while ((j > 0) && (EQ3DeviceCmp(sortedIndex[j - 1], key) > 0)) {
+      sortedIndex[j] = sortedIndex[j - 1];
+      j--;
+    }
+    sortedIndex[j] = key;
+  }
+
+  // Display active devices in sorted order
+  for (uint8_t i = 0; i < activeDevicesCount; i++) {
+    const auto& device = EQ3Devices[sortedIndex[i]];
+    if (FirstSensorShown) WSContentSend_P(HTTP_SNS_HR_THIN);
+    FirstSensorShown = true;
+
+    char tlabel[16];
+    const char* label = EQ3DeviceName(tlabel, sizeof(tlabel), &device);
+
+    char Firmware[16] = "";
+    if (device.firmwareValid) {
+      snprintf(Firmware, sizeof(Firmware), " - V%u.%02u", device.Firmware / 100, device.Firmware % 100);
+    }
+
+    uint8_t rssi_as_quality = WifiGetRssiAsQuality(device.RSSI);
+    uint8_t num_bars = changeUIntScale(rssi_as_quality, 0, 100, 0, 4);
+    char rssi[16];
+    snprintf(rssi, sizeof(rssi), "%d%% (%d dBm)", rssi_as_quality, device.RSSI);
+
+    WSContentSend_P(HTTP_EQ3_STATUS1, Firmware, device.addr, label);
+    if (device.cryptState) WSContentSend_P(HTTP_EQ3_STATUS2, D_DECRYPTION " " D_FAILED, "<del>🔑</del>");
+    bool showData = (!EQ3Period || device.BTHomeAdvert || device.lastStatusTime + (EQ3Period * 10) > UtcTime());
+    if (showData) {
+      if (device.Lock && device.lockValid) WSContentSend_P(HTTP_EQ3_STATUS2, D_CHILD_LOCK, "🔒");
+      if (device.Boost && device.boostValid) WSContentSend_P(HTTP_EQ3_STATUS2, D_BOOST, "🔥");
+      if (device.Window && device.windowValid) WSContentSend_P(HTTP_EQ3_STATUS2, D_WINDOW_OPEN, "🪟");
+      if (device.modeValid) {
+        const char* modeTitle = web_mode_names[device.Mode];
+        char holidayBuffer[32];
+        if (device.holidayEndValid && device.Mode == 2) {
+          snprintf(holidayBuffer, sizeof(holidayBuffer), "%s\n20%02d-%02d-%02d %02d:%02d", web_mode_names[2], device.holidayEndYear, device.holidayEndMonth, device.holidayEndDay, device.holidayEndHour, device.holidayEndMinute);
+          modeTitle = holidayBuffer;
+        }
+        WSContentSend_P(HTTP_EQ3_STATUS2, modeTitle, web_mode_icons[device.Mode]);
+      }
+      if (device.batteryValid) WSContentSend_P(HTTP_EQ3_STATUS2,
+          (device.battPercent && device.battVoltValid) ? (String(device.battPercent) + "%") : (device.Battery ? D_LOW : D_OK),
+          device.Battery ? "🪫" : "🔋");
+    }
+
+    WSContentSend_P(" <span title='" D_RSSI " %s' class='si'>", rssi);
+    for (uint8_t j = 0; j < 4; j++) {
+      WSContentSend_P("<i class='b%d%s'></i>", j, (j >= num_bars) ? " o30" : "");
+    }
+    WSContentSend_P("</span></span>{e}");
+
+    if (showData) {
+      if (device.tempValid) WSContentSend_Temp("┆", device.Temperature);
+      if (device.targetTempValid) WSContentSend_PD(HTTP_EQ3_TEMPERATURE, Settings->flag2.temperature_resolution, &device.TargetTemp, c_unit);
+      if (device.valveValid) WSContentSend_P(HTTP_EQ3_VALVE_POS, device.ValvePos);
+    }
+  }
+}
+#endif // USE_WEBSERVER
+
+void EQ3publishUpdate(void) {
+  for (auto& device : EQ3Devices) {
+    if (!device.timeoutTime) continue;
+    if (!device.lastStatusTime) continue;
+    Response_P("{");
+    EQ3publishMain(&device);
+    ResponseJsonEnd();
+    MqttPublish(topicPrefix((int)STAT, device.addr, BLE_ESP32::getAlias(device.addr)), false);
+  }
+}
+
+void EQ3publishMain(eq3_device_t* eq3) {
+  ResponseAppend_P("\"MAC\":\"%s\"", addrStr(eq3->addr));
+  const char* alias = BLE_ESP32::getAlias(eq3->addr);
+  if (alias && *alias) ResponseAppend_P(",\"Alias\":\"%s\"", alias);
+  ResponseAppend_P(",\"tas\":\"%s\"", NetworkHostname());
+  ResponseAppend_P(",\"RSSI\":%d", eq3->RSSI);
+  if (eq3->firmwareValid) ResponseAppend_P(",\"Firmware\":\"%u.%02u\"", eq3->Firmware / 100, eq3->Firmware % 100);
+  ResponseAppend_P(",\"stattime\":%u", eq3->BTHomeAdvert ? UtcTime() : eq3->lastStatusTime);
+  if (eq3->targetTempValid) ResponseAppend_P(",\"temp\":%1_f", &eq3->TargetTemp);
+  if (eq3->valveValid) ResponseAppend_P(",\"posn\":%u", eq3->ValvePos);
+  if (eq3->modeValid) {
+    ResponseAppend_P(",\"mode\":\"%s\"", mqtt_mode_names[eq3->Mode]);
+    if (eq3->holidayEndValid && eq3->Mode == 2) ResponseAppend_P(",\"holidayend\":\"%02d-%02d-%02d %02d:%02d\"", eq3->holidayEndYear, eq3->holidayEndMonth, eq3->holidayEndDay, eq3->holidayEndHour, eq3->holidayEndMinute);
+
+    // Home Assistant allowed modes: ["auto", "off", "heat", ("cool", "dry", "fan_only")]
+    const char* hass_mode = "auto";
+    if (eq3->Mode == 1) {
+      // If in manual mode (1), report "heat" only if temperature is above 4.5°C (op->dataNotify[5] > 9)
+      // and the valve is actually open (op->dataNotify[3] > 0). Otherwise, report "off".
+      hass_mode = (eq3->TargetTemp > 4.5 && eq3->ValvePos) ? "heat" : "off";
+    }
+    ResponseAppend_P(",\"hassmode\":\"%s\"", hass_mode);
+  }
+  if (eq3->boostValid) ResponseAppend_P(",\"boost\":\"%s\"", eq3->Boost ? "active" : "inactive");
+  if (eq3->windowValid) ResponseAppend_P(",\"window\":\"%s\"", eq3->Window ? "open" : "closed");
+  if (eq3->lockValid) ResponseAppend_P(",\"state\":\"%s\"", eq3->Lock ? "locked" : "unlocked");
+  if (eq3->DSTValid) ResponseAppend_P(",\"dst\":\"%s\"", eq3->DST ? "set" : "unset");
+  if (eq3->batteryValid) ResponseAppend_P(",\"battery\":\"%s\"", eq3->Battery ? "LOW" : "GOOD");
+  if (eq3->battVoltValid) {
+    ResponseAppend_P(",\"BattLevel\":%u", eq3->battPercent);
+    ResponseAppend_P(",\"BattVolt\":%3_f", &eq3->battVolt);
+  }
+  if (eq3->tempValid) ResponseAppend_P(",\"Ambient\":%1_f", &eq3->Temperature);
+}
+
+/*********************************************************************************************\
+ * Commands
+\*********************************************************************************************/
+//
+// great description here:
+// https://reverse-engineering-ble-devices.readthedocs.io/en/latest/protocol_description/00_protocol_description.html
+// not all implemented yet.
+//
+int EQ3Send(const uint8_t* addr, uint8_t CmdIdx, const char* param1, const char* param2, bool useAlias) {
+  if (!param1) param1 = "";
+  if (!param2) param2 = "";
+  uint8_t d[20] {};
+  uint8_t dlen = 0;
+#ifdef EQ3_DEBUG
+  AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_INFO], "EQ3: %s: cmd: [%s] [%s] [%s]", addrStr(addr), IdxToTrvCmd(CmdIdx), param1, param2);
+#endif
+
+  switch (CmdIdx) {
+    case TRV_RAW: {
+      if (!*param1) return -1;
+
+      int len = strlen(param1) / 2;
+      if (len > 20) {
+        AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Raw len of %s = %d > 20", addrStr(addr), param1, len);
+        return -1;
+      }
+      BLE_ESP32::fromHex(d, param1, len);
+      dlen = len;
+      break;
+    }
+
+    case TRV_INFO: {
+      d[0] = 0x00;
+      dlen = 1;
+      break;
+    }
+
+    case TRV_POLL:
+      EQ3Send(addr, TRV_INFO, nullptr, nullptr, useAlias);  // Fallthrough is wanted
+    case TRV_STATE:
+    case TRV_SETTIME: {
+      if (!*param1) {
+        if (RtcTime.valid) {
+          d[0] = 0x03;
+          d[1] = (RtcTime.year % 100);
+          d[2] = RtcTime.month;
+          d[3] = RtcTime.day_of_month;
+          d[4] = RtcTime.hour;
+          d[5] = RtcTime.minute;
+          d[6] = RtcTime.second;
+        } else {
+          return -1;
+        }
+      } else {
+        d[0] = 0x03;
+        BLE_ESP32::fromHex(d + 1, param1, 6);
+      }
+      dlen = 7;
+      break;
+    }
+
+    case TRV_SETTEMP: {
+      if (!*param1) return -1;
+
+      float ftemp = atof(param1);
+      if (ftemp < 4.5) ftemp = 4.5;
+      if (ftemp > 30) ftemp = 30;
+
+      d[0] = 0x41;
+      d[1] = (uint8_t)(ftemp * 2);
+      dlen = 2;
+      break;
+    }
+
+    case TRV_OFFSET: {
+      if (!*param1) return -1;
+
+      float ftemp = atof(param1);
+      if (ftemp < -3.5) ftemp = -3.5;
+      if (ftemp > 3.5) ftemp = 3.5;
+
+      d[0] = 0x13;
+      d[1] = (int8_t)(ftemp * 2 + 7);
+      dlen = 2;
+      break;
+    }
+
+    case TRV_SETDAYNIGHT: {
+      if (!*param1 || !*param2) return -1;
+
+      d[0] = 0x11;
+
+      float ftemp = atof(param1);
+      if (ftemp < 4.5) ftemp = 4.5;
+      if (ftemp > 30)  ftemp = 30;
+      d[1] = (uint8_t)(ftemp * 2);
+
+      ftemp = atof(param2);
+      if (ftemp < 4.5) ftemp = 4.5;
+      if (ftemp > 30)  ftemp = 30;
+      d[2] = (uint8_t)(ftemp * 2);
+
+      dlen = 3;
+      break;
+    }
+
+    case TRV_SETWINDOWTEMPDUR: {
+      if (!*param1 || !*param2) return -1;
+
+      float ftemp = atof(param1);
+      if (ftemp < 4.5) ftemp = 4.5;
+      if (ftemp > 30)  ftemp = 30;
+
+      uint8_t dur = atoi(param2);
+      if (dur > 20) dur = 20;
+
+      d[0] = 0x14;
+      d[1] = (uint8_t)(ftemp * 2);
+      d[2] = dur / 5;
+      dlen = 3;
+      break;
+    }
+
+    case TRV_SETHOLIDAY: {
+      //40941C152402
+      // 40 94
+      if (!*param1 || !*param2) return -1;
+
+      char *p1 = nullptr, *p2 = nullptr, *p3 = nullptr, *p4 = nullptr, *p5 = nullptr;
+      uint8_t yy   = (int)strtol(param1, &p1, 10);
+      uint8_t mm   = (p1 && p1[0] == '-') ? (int)strtol(p1 + 1, &p2, 10) : 255;
+      uint8_t dd   = (p2 && p2[0] == '-') ? (int)strtol(p2 + 1, &p3, 10) : 255;
+      uint8_t hour = (p3 && p3[0] == ',') ? (int)strtol(p3 + 1, &p4, 10) : 255;
+      uint8_t min  = (p4 && p4[0] == ':') ? (int)strtol(p4 + 1, &p5, 10) : 255;
+      float ftemp = atof(param2);
+
+      AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: setholiday: %02d-%02d-%02d,%02d:%02d %1_f", addrStr(addr), yy, mm, dd, hour, min, &ftemp);
+
+      if (yy > 99 || !mm || mm > 12 || !dd || dd > 31 || hour > 23 || min > 59) return -1;
+
+      if (ftemp < 4.5)  ftemp = 4.5;
+      if (ftemp > 29.5) ftemp = 29.5; // Cannot be set to more than 29.5 in this command
+
+      d[0] = 0x40;
+      d[1] = (uint8_t)(ftemp * 2 + 128);
+      d[2] = dd;
+      d[3] = yy;
+      d[4] = (hour * 60 + min) / 30;
+      d[5] = mm;
+      dlen = 6;
+      break;
+    }
+
+    case TRV_BOOST: {
+      d[0] = 0x45;
+      d[1] = 0x01;
+      if (*param1 == '0' || !strcasecmp(param1, "off")) d[1] = 0x00;
+      dlen = 2;
+      break;
+    }
+
+    case TRV_UNBOOST: {
+      d[0] = 0x45;
+      d[1] = 0x00;
+      dlen = 2;
+      break;
+    }
+
+    case TRV_LOCK: {
+      d[0] = 0x80;
+      d[1] = 0x01;
+      if (*param1 == '0' || !strcasecmp(param1, "off")) d[1] = 0x00;
+      dlen = 2;
+      break;
+    }
+
+    case TRV_UNLOCK: {
+      d[0] = 0x80;
+      d[1] = 0x00;
+      dlen = 2;
+      break;
+    }
+
+    case TRV_AUTO: {
+      d[0] = 0x40;
+      d[1] = 0x00;
+      dlen = 2;
+      break;
+    }
+
+    case TRV_HEAT:
+    case TRV_MANUAL: {
+      d[0] = 0x40;
+      d[1] = 0x40;
+      dlen = 2;
+      break;
+    }
+
+/*
+    // this is basically 'cancel holiday' - mode auto does that.
+    case TRV_ECO: {
+      d[0] = 0x40;
+      d[1] = 0x80;
+      dlen = 2;
+      break;
+    }
+*/
+
+    case TRV_ON: {
+      if (EQ3Send(addr, TRV_MANUAL, nullptr, nullptr, useAlias) < 1) return -1;
+      return EQ3Send(addr, TRV_SETTEMP, "30", nullptr, useAlias);
+    }
+
+    case TRV_COOL:
+    case TRV_FANONLY:
+    case TRV_OFF: {
+      if (EQ3Send(addr, TRV_MANUAL, nullptr, nullptr, useAlias) < 1) return -1;
+      return EQ3Send(addr, TRV_SETTEMP, "4.5", nullptr, useAlias);
+    }
+
+    case TRV_VALVE: {
+      if (!*param1) return -1;
+      d[0] = 0x41;
+      d[1] = 0x3c;
+      if (*param1 == '0' || !strcasecmp(param1, "off")) d[1] = 0x09;
+      dlen = 2;
+      break;
+    }
+
+    case TRV_MODE: {
+      if (!*param1) return -1;
+      return EQ3Send(addr, TrvCmdToIdx(param1), nullptr, nullptr, useAlias);
+    }
+
+    case TRV_DAY: {
+      d[0] = 0x43;
+      dlen = 1;
+      break;
+    }
+    
+    case TRV_NIGHT: {
+      d[0] = 0x44;
+      dlen = 1;
+      break;
+    }
+
+    case TRV_REQPROFILE: {
+      if (!*param1) return -1;
+      d[0] = 0x20;
+      d[1] = atoi(param1);
+      dlen = 2;
+      break;
+    }
+
+    case TRV_SETPROFILE: {
+      if (!*param1 || !*param2) return -1;
+
+      d[0] = 0x10;
+      d[1] = atoi(param1);
+
+      // default
+      uint8_t temps[7] = {0x22,0x22,0x22,0x22,0x22,0x22,0x22};
+      uint8_t times[7] = {0x90,0x90,0x90,0x90,0x90,0x90,0x90};
+
+      // 20.5-17:30,
+      const char* p = param2;
+      uint8_t i = 0;
+      while (p && *p) {
+        char *p1 = nullptr, *p2 = nullptr, *p3 = nullptr;
+        float ftemp = strtof(p, &p1);
+        uint8_t hh = (p1 && *p1 == '-') ? (int)strtol(p1 + 1, &p2, 10) : 255;
+        uint8_t mm = (p2 && *p2 == ':') ? (int)strtol(p2 + 1, &p3, 10) : 255;
+
+        AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: %s: setprofile%d[%d]: %1_f-%02d:%02d", addrStr(addr), d[1], i, &ftemp, hh, mm);
+
+        if (hh > 24 || mm > 59) return -1;
+
+        if (ftemp < 4.5) ftemp = 4.5;
+        if (ftemp > 30)  ftemp = 30;
+
+        temps[i] = (uint8_t)(ftemp * 2);
+        times[i] = (hh * 60 + mm) / 10;
+        p = (p3 && *p3 == ',') ? p3 + 1 : nullptr;
+        i++;
+        if (i >= 7) break;
+      }
+
+      // remaining left at 00 00
+      for (uint8_t j = 0; j < 7; j++) {
+        d[2 + j * 2] = temps[j];
+        d[2 + j * 2 + 1] = times[j];
+      }
+
+      dlen = 16; // 2 + 14
+      break;
+    }
+
+    case TRV_WINDOW: {
+      if (!*param1) return -1;
+      d[0] = 0x30;
+      d[1] = atoi(param1);
+      dlen = 2;
+      break;
+    }
+
+    default: {
+      return -1;
+    }
+  }
+
+  if (dlen) {
+    dlen = 16;
+    return EQ3QueueOp(addr, d, dlen, CmdIdx, useAlias);
+
+    //return EQ3Operation(addr, d, dlen, 4);
+  }
+  return -1;
+}
+
+uint8_t CmndTrvNext(char* data) {
+
+  char* p = strtok(data, " ");
+  if (!strcasecmp(p, "reset")) {
+    CmndTrvReset(); // only for compability and will removed in future - new command is TrvReset
+    return TRV_DONE;
+  }
+
+  if (!strcasecmp(p, "devlist") || !strcasecmp(p, "scan")) {
+#ifdef EQ3_DEBUG
+    AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_DEBUG], "EQ3: cmd: %s", p);
+#endif
+    CmndTrvDevList(); // only for compability and will removed in future - new commands are TrvDevList or TrvScan
+    return TRV_DONE;
+  }
+
+  // only allow one command in progress
+  //if (retries) return TRV_IGNOREDBUSY;
+
+  uint8_t addrbin[7]; // Must be 7, because addrbin[6] contains the type
+  int addrResult = BLE_ESP32::getAddr(addrbin, p);
+  if (!addrResult) {
+    AddLog(LOG_LEVEL_ERROR, "EQ3: Address invalid: %s", p);
+    return TRV_INVADDR;
+  }
+  bool useAlias = (addrResult == 2);
+  if (useAlias) AddLog(LOG_LEVEL_DEBUG, "EQ3: %s: Used alias: %s", addrStr(addrbin), p);
+//  NimBLEAddress addr(addrbin, addrbin[6]); // Object addr not used, only addrbin. Maybe we use it in future.
+
+#ifdef EQ3_DEBUG
+  //AddLog(BLE_ESP32::BLELogLevel[LOG_LEVEL_INFO], PSTR("EQ3: cmd addr: %s -> %s"), p, addrStr(addrbin));
+#endif
+
+  // get index of next part of cmd
+  char* cmd = strtok(nullptr, " ");
+  uint8_t CmdIdx = TrvCmdToIdx(cmd);
+  if (CmdIdx == TRV_UNKNOWN) return TRV_INVCMD;
+
+  char* param1 = strtok(nullptr, " ");
+  char* param2 = nullptr;
+  if (param1) {
+    param2 = strtok(nullptr, " ");
+  }
+
+  int res = EQ3Send(addrbin, CmdIdx, param1, param2, useAlias);
+
+  if (res > 0) { // succeeded to queue
+    AddLog(LOG_LEVEL_INFO, "EQ3: %s: Command \"%s\" queued", addrStr(addrbin), IdxToTrvCmd(CmdIdx));
+    return TRV_QUEUED;
+  }
+
+  if (res < 0) { // invalid in some way
+    AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Command \"%s\" failed", addrStr(addrbin),  IdxToTrvCmd(CmdIdx));
+    return TRV_INVCMD;
+  }
+
+  // failed to queue
+  AddLog(LOG_LEVEL_ERROR, "EQ3: %s: Command \"%s\" failed to queue", addrStr(addrbin),  IdxToTrvCmd(CmdIdx));
+  return TRV_CMDFAIL;
+}
+
+void CmndTrv(void) {
+  uint8_t res = CmndTrvNext(XdrvMailbox.data);
+  ResponseCmndChar(TrvResponses[res]);
+}
+
+void CmndTrvPeriod(void) {
+  if (XdrvMailbox.data_len) {
+    if (XdrvMailbox.payload == 1) {
+      NextPollSeconds = 1;
+    } else {
+      EQ3Period = XdrvMailbox.payload;
+      if (EQ3Period) EQ3Period = tmax(EQ3Period, EQ3_NUM_DEVICESLOTS);
+      NextPollSeconds = tmin(NextPollSeconds, EQ3Period);
+    }
+  }
+  ResponseCmndNumber(EQ3Period);
+}
+
+void CmndTrvRetries(void) {
+  if (XdrvMailbox.data_len) {
+    EQ3Retries = tmin(XdrvMailbox.payload, 10);
+  }
+  ResponseCmndNumber(EQ3Retries);
+}
+
+void CmndTrvOnlyAliased(void) {
+  if (XdrvMailbox.data_len) {
+    EQ3OnlyAliased = tmin(XdrvMailbox.payload, 2);
+  }
+  ResponseCmndNumber(EQ3OnlyAliased);
+}
+
+void CmndTrvAliasAsTopic(void) {
+  if (XdrvMailbox.data_len) {
+    EQ3AliasAsTopic = XdrvMailbox.payload;
+  }
+  ResponseCmndNumber(EQ3AliasAsTopic);
+}
+
+void CmndTrvMinRSSI(void) {
+  if (XdrvMailbox.data_len) {
+    trvMinRSSI = tmax(tmin(XdrvMailbox.payload, 0), -99);
+  }
+  ResponseCmndNumber(trvMinRSSI);
+}
+
+void CmndTrvHideFailedPoll(void) {
+  if (XdrvMailbox.data_len) {
+    EQ3HideFailedPoll = XdrvMailbox.payload;
+  }
+  ResponseCmndNumber(EQ3HideFailedPoll);
+}
+
+void CmndTrvReset(void) {
+  retries = 0;
+  for (auto& device : EQ3Devices) device = eq3_device_t{};
+  opQueue.clear();
+  opInProgress = false;
+  ResponseCmndDone();
+}
+
+void CmndTrvDevList(void) {
+  EQ3SendCurrentDevices();
+  ResponseCmndDone();
+}
+
+#define EQ3_TOPIC "EQ3"
+static char tmp[120];
+
+bool mqtt_direct() {
+  char stopic[TOPSZ];
+  strncpy(stopic, XdrvMailbox.topic, TOPSZ);
+  XdrvMailbox.topic[TOPSZ-1] = 0;
+
+  AddLog(LOG_LEVEL_DEBUG, "EQ3: mqtt: %s:%s", stopic, XdrvMailbox.data);
+
+  char* items[10];
+  char* p = stopic;
+  int cnt = 0;
+  do {
+    items[cnt] = strtok(p, "/");
+    cnt++;
+    p = nullptr;
+  } while (items[cnt-1]);
+  cnt--; // represents the number of items
+
+  if (cnt < 4) { // not for us?
+    //AddLog(LOG_LEVEL_INFO, PSTR("cnt: %d < 4"), cnt);
+    return false;
+  }
+
+  for (int i = 0; i < cnt; i++) {
+    //AddLog(LOG_LEVEL_INFO, PSTR("cnt %d:%s"), i, items[i]);
+  }
+
+  int EQ3index = 0;
+  int MACindex = 0;
+  int CMDindex = 0;
+  if (strcasecmp(items[cnt-3], EQ3_TOPIC)) {
+    //AddLog(LOG_LEVEL_INFO, PSTR("cnt-3 not %s"), PSTR(EQ3_TOPIC));
+    if (strcasecmp(items[cnt-2], EQ3_TOPIC)) {
+      //AddLog(LOG_LEVEL_INFO, PSTR("cnt-2 not %s"), PSTR(EQ3_TOPIC));
+      return false; // not for us
+    } else {
+      EQ3index = cnt - 2;
+      MACindex = cnt - 1;
+    }
+  } else {
+    EQ3index = cnt - 3;
+    MACindex = cnt - 2;
+    CMDindex = cnt - 1;
+  }
+
+  int remains = 120;
+  memset(tmp, 0, sizeof(tmp));
+  p = tmp;
+  uint8_t addr[7]; // Must be 7, because addr[6] contains the type
+  uint8_t res = TRV_INVADDR; // invalid address/alias
+
+  // if address or alias valid
+  if (BLE_ESP32::getAddr(addr, items[MACindex])) {
+    strncpy(p, items[MACindex], remains - 6);
+    p += strlen(p);
+    *(p++) = 0x20;
+    remains = 120 - (p - tmp);
+
+    if (CMDindex) {
+      strncpy(p, items[CMDindex], remains - 6);
+      p += strlen(p);
+      *(p++) = 0x20;
+      remains = 120 - (p - tmp);
+    }
+
+    strncpy(p, XdrvMailbox.data, remains - 6);
+    p += strlen(p);
+    *(p++) = 0x20;
+    remains = 120 - (p - tmp);
+    *(p++) = 0;
+
+    AddLog(LOG_LEVEL_DEBUG, "EQ3: mqtt->cmdstr %s", tmp);
+    res = CmndTrvNext(tmp);
+  }
+
+  // post result to stat/tas/EQ3/<MAC> {"result":"<string>"}
+  EQ3SendResult(items[MACindex], TrvResponses[res]);
+
+  return true;
+}
+
+
+///////////////////////////////////////////////
+// starts a completely fresh MQTT message.
+// sends ONE sensor's worth of HA discovery msg
+constexpr const char EQ3_HA_DISCOVERY_TEMPLATE[] =
+  "{\"availability\":[],\"device\":"
+  "{\"identifiers\":[\"BLE%s\"],"
+  "\"name\":\"%s\","
+  "\"manufacturer\":\"tas\","
+  "\"model\":\"%s\","
+  "\"via_device\":\"%s\""
+  "},"
+  "\"dev_cla\":\"%s\","
+  "\"expire_after\":600,"
+  "\"json_attr_t\":\"%s\","
+  "\"name\":\"%s_%s\","
+  "\"state_topic\":\"%s\","
+  "\"uniq_id\":\"%s_%s\","
+  "\"unit_of_meas\":\"%s\","
+  "\"val_tpl\":\"{{ value_json.%s }}\"}";
+
+///////////TODO - unfinished.....
+void EQ3DiscoveryOneEQ3() {
+  // don't detect half-added ones here
+  if (EQ3CurrentSingleSlot >= EQ3_NUM_DEVICESLOTS) {
+    // if we got to the end of the sensors, then don't send more
+    return;
+  }
+
+#ifdef USE_HOME_ASSISTANT
+  if(Settings->flag.hass_discovery) {
+    eq3_device_t* p;
+    do {
+      p = &EQ3Devices[EQ3CurrentSingleSlot];
+      if (0 == p->timeoutTime) {
+        EQ3CurrentSingleSlot++;
+      }
+    } while ((0 == p->timeoutTime) && (EQ3CurrentSingleSlot <= EQ3_NUM_DEVICESLOTS));
+
+    if (EQ3CurrentSingleSlot >= EQ3_NUM_DEVICESLOTS) {
+      return;
+    }
+
+    // careful - a missing comma causes a crash!!!!
+    // because of the way we loop?
+    constexpr const char* classes[] = {
+      "temperature",
+      "temp",
+      "°C",
+      "signal_strength",
+      "RSSI",
+      "dB"
+    };
+
+    constexpr size_t datacount = sizeof(classes) / sizeof(*classes) / 3;
+
+    if (p->nextDiscoveryData >= datacount) {
+      p->nextDiscoveryData = 0;
+    }
+
+    char DiscoveryTopic[80];
+    const char* host = NetworkHostname();
+    const char* devtype = "EQ3";
+    char idstr[32];
+    const char* alias = BLE_ESP32::getAlias(p->addr);
+    const char* id = idstr;
+    if (alias && *alias) {
+      id = alias;
+    } else {
+      sprintf(idstr, "%s%02x%02x%02x",
+            devtype,
+            p->addr[3], p->addr[4], p->addr[5]);
+    }
+
+    char SensorTopic[60];
+    sprintf(SensorTopic, "stat/%s/EQ3/%s",
+      host, id);
+
+    //int i = p->nextDiscoveryData*3;
+    for (size_t i = 0; i < datacount * 3; i += 3) {
+      if (!classes[i] || !classes[i + 1] || !classes[i + 2]) {
+        return;
+      }
+
+      ResponseClear();
+
+    /*
+    {"availability":[],"device":{"identifiers":["TasmotaBLEa4c1387fc1e1"],"manufacturer":"simon","model":"someBLEsensor","name":"TASBLEa4c1387fc1e1","sw_version":"0.0.0"},"dev_cla":"temperature","json_attr_t":"stat/tasmota_esp32/SENSOR","name":"TASLYWSD037fc1e1Temp","state_topic":"tele/tasmota_esp32/SENSOR","uniq_id":"Tasmotaa4c1387fc1e1temp","unit_of_meas":"°C","val_tpl":"{{ value_json.LYWSD037fc1e1.Temperature }}"}
+    {"availability":[],"device":{"identifiers":["TasmotaBLEa4c1387fc1e1"],
+    "name":"TASBLEa4c1387fc1e1"},"dev_cla":"temperature",
+    "json_attr_t":"tele/tasmota_esp32/SENSOR",
+    "name":"TASLYWSD037fc1e1Temp","state_topic":  "tele/tasmota_esp32/SENSOR",
+    "uniq_id":"Tasmotaa4c1387fc1e1temp","unit_of_meas":"°C",
+    "val_tpl":"{{ value_json.LYWSD037fc1e1.Temperature }}"}
+    */
+
+      ResponseAppend_P(EQ3_HA_DISCOVERY_TEMPLATE,
+      //"{\"identifiers\":[\"BLE%s\"],"
+        id,
+      //"\"name\":\"%s\"},"
+        id,
+      //\"model\":\"%s\",
+        devtype,
+      //\"via_device\":\"%s\"
+        host,
+      //"\"dev_cla\":\"%s\","
+        classes[i],
+      //"\"json_attr_t\":\"%s\"," - the topic the sensor publishes on
+        SensorTopic,
+      //"\"name\":\"%s_%s\"," - the name of this DATA
+        id, classes[i+1],
+      //"\"state_topic\":\"%s\","  - the topic the sensor publishes on?
+        SensorTopic,
+      //"\"uniq_id\":\"%s_%s\"," - unique for this data,
+        id, classes[i+1],
+      //"\"unit_of_meas\":\"%s\"," - the measure of this type of data
+        classes[i+2],
+      //"\"val_tpl\":\"{{ value_json.%s }}") // e.g. Temperature
+        classes[i+1]
+          //
+      );
+
+      sprintf(DiscoveryTopic, "homeassistant/sensor/%s/%s/config",
+        id, classes[i+1]);
+
+      MqttPublish(DiscoveryTopic);
+      p->nextDiscoveryData++;
+      //vTaskDelay(100/ portTICK_PERIOD_MS);
+    }
+  } // end if hass discovery
+  //AddLog_P(LOG_LEVEL_DEBUG, PSTR("M32: %s: show some %d %s"), D_CMND_MI32, MI32.mqttCurrentSlot, TasmotaGlobal.mqtt_data);
+#endif //USE_HOME_ASSISTANT
+
+}
+
+} // end namespace EQ3_ESP32
+
+/*********************************************************************************************\
+ * Interface
+\*********************************************************************************************/
+
+bool Xdrv85(uint32_t function)
+{
+  bool result = false;
+
+  switch (function) {
+    case FUNC_INIT:
+      EQ3_ESP32::EQ3Init();
+      break;
+    case FUNC_EVERY_SECOND:
+      EQ3_ESP32::EQ3EverySecond();
+      break;
+    case FUNC_COMMAND:
+      result = DecodeCommand(EQ3_ESP32::kEQ3_Commands, EQ3_ESP32::EQ3_Commands);
+      break;
+    case FUNC_MQTT_DATA:
+      //AddLog(LOG_LEVEL_INFO, PSTR("topic %s"), XdrvMailbox.topic);
+      result = EQ3_ESP32::mqtt_direct();
+      break;
+    case FUNC_AFTER_TELEPERIOD:
+      EQ3_ESP32::EQ3publishUpdate();
+      break;
+    case FUNC_JSON_APPEND:
+      break;
+#ifdef USE_WEBSERVER
+    case FUNC_WEB_SENSOR:
+      EQ3_ESP32::EQ3Show();
+      break;
+#endif  // USE_WEBSERVER
+    case FUNC_ACTIVE:
+      result = true;
+      break;
+    }
+  return result;
+}
+#endif  //
+#endif  // ESP32
+
+#endif
+#endif  // CONFIG_IDF_TARGET_ESP32
